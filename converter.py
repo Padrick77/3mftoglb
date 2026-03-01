@@ -445,6 +445,12 @@ def convert_3mf_to_glb(input_path, output_path=None, extract_glb=True, extract_t
                         f.write(img_data)
                     print(f"  Extracted thumbnail: {os.path.basename(img_out_path)}")
 
+        if not extract_glb:
+            if not extract_thumbnails:
+                print("ERROR: No output options selected.")
+                return False
+            return True
+
         # --- Detect filament colors ---
         filament_colors = get_filament_colors(zf)
         if filament_colors:
@@ -464,12 +470,8 @@ def convert_3mf_to_glb(input_path, output_path=None, extract_glb=True, extract_t
                 if name.lower() == "3d/3dmodel.model":
                     main_model_name = name
 
-        if extract_glb and not model_files:
+        if not model_files:
             print("ERROR: No model files found.")
-            return False
-            
-        if not extract_glb and not extract_thumbnails:
-            print("ERROR: No output options selected.")
             return False
 
         if model_files and extract_glb:
