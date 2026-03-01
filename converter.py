@@ -676,8 +676,14 @@ def convert_3mf_to_glb(input_path, output_path=None, extract_glb=True, extract_t
     print(f"  Total triangles: {total_faces:,}")
     print(f"  Total vertices: {total_vertices:,}")
 
-    # --- Export GLB ---
-    print(f"\nSaved: {output_path} ({size_str})")
+    # Export the GLB
+    # The actual export was previously handled by pygltflib, but here we just need to use trimesh
+    # to combine the meshes and save the result.
+    
+    scene = trimesh.Scene(prepared_meshes)
+    scene.export(output_path)
+
+    print(f"\nSaved: {output_path}")
     return True
 
 
