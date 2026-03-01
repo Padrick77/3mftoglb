@@ -10,19 +10,38 @@ Existing converters lose color data. This tool properly handles:
 - **Multi-part models** — components with transforms
 - **Sharp face colors** — no interpolation at shared edges
 
+## Features
+
+- **Accurate Colors:** Preserves per-triangle `basematerials`, `colorgroups`, and BambuStudio/PrusaSlicer specific `paint_color`/`mmu_segmentation` data.
+- **Batch Processing:** Convert hundreds of files at once via the GUI or command line.
+- **Thumbnail Extraction:** Optionally extracts embedded `.png` cover photos from the 3MF archive.
+- **Web-Optimized:** Unpainted models are exported using standard PBRMaterials (instead of baked vertex colors) to drastically reduce GLB file size and allow dynamic recoloring in web viewers.
+
 ## Usage
 
-### Drag & Drop
-Drag a `.3mf` file onto `3mf2glb.exe` — the `.glb` file will be saved next to the original.
+### 1. Standalone GUI (Recommended)
+Double-click `3mf2glb.exe` with no arguments to open the desktop interface:
+- Click **Add 3MF Files** to select multiple files at once.
+- Check/Uncheck **GLB File** or **Thumbnails** depending on what outputs you want.
+- Click **Convert All** to process the queue. The live log will show progress and status.
 
-### Command Line
-```
+### 2. Drag & Drop
+Drag one or more `.3mf` files onto `3mf2glb.exe`. The app will process them in the background and save the `.glb` files next to the originals.
+
+### 3. Command Line (Batch & Single)
+```bash
+# Convert a single file
 3mf2glb.exe model.3mf
-3mf2glb.exe model.3mf output.glb
-```
 
-### Double-Click
-Run `3mf2glb.exe` with no arguments to open a file picker dialog.
+# Convert a single file and specify output name
+3mf2glb.exe model.3mf output.glb
+
+# Convert an entire directory of 3MF files
+3mf2glb.exe C:\path\to\folder\
+
+# Convert multiple specific files
+3mf2glb.exe model1.3mf model2.3mf model3.3mf
+```
 
 ## Building from Source
 
