@@ -2,12 +2,22 @@
 3MF to GLB Converter
 Converts 3D Manufacturing Format (.3mf) files to GL Binary (.glb) files
 with accurate per-triangle color preservation.
+
+Supports:
+- Standard 3MF basematerials and colorgroups
+- BambuStudio/Orca Slicer paint_color format
+- Multi-file 3MF packages (sub-models in 3D/Objects/)
+- Multi-part assemblies with component transforms
+- Large files (streaming XML parser for 300MB+ models)
 """
 
 import sys
 import os
 import zipfile
+import json
+import io
 import xml.etree.ElementTree as ET
+from collections import Counter
 import numpy as np
 import trimesh
 
@@ -15,15 +25,11 @@ import trimesh
 # 3MF XML namespaces
 NS_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 NS_MATERIAL = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
-
-NAMESPACES = {
-    "core": NS_CORE,
-    "m": NS_MATERIAL,
-}
+NS_PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
 
 
 def parse_hex_color(hex_str):
-    """Parse a hex color string (#RRGGBB or #RRGGBBAA) to RGBA 0-255 array."""
+    """Parse a hex color string (#RRGGBB or #RRGGBBAA) to RGBA 0-255 list."""
     hex_str = hex_str.lstrip("#")
     r = int(hex_str[0:2], 16)
     g = int(hex_str[2:4], 16)
@@ -32,302 +38,472 @@ def parse_hex_color(hex_str):
     return [r, g, b, a]
 
 
-def find_model_xml(zip_file):
-    """Find the 3D model XML file inside the 3MF ZIP archive."""
-    # Standard location
+def decode_paint_color(paint_color_hex):
+    """
+    Decode BambuStudio/Slic3r paint_color attribute.
+    
+    The paint_color is a hex-nibble-encoded bit stream representing a recursive
+    triangle subdivision tree (TriangleSelector format):
+    - Convert hex string to bits (MSB first within each nibble)
+    - Read 2-bit states from the bit stream (bit0 + bit1*2)
+    - State 0 = subdivided into 4 children (read 4 more states recursively)
+    - States 1-3 = painted with filament/extruder
+    
+    Returns the dominant state as a filament index (state value used directly).
+    """
+    if not paint_color_hex:
+        return 0
+
+    # Convert hex string to bit array (MSB first within each nibble)
+    bits = []
+    for ch in paint_color_hex:
+        nibble = int(ch, 16)
+        bits.append((nibble >> 3) & 1)
+        bits.append((nibble >> 2) & 1)
+        bits.append((nibble >> 1) & 1)
+        bits.append(nibble & 1)
+
+    # State counter: count leaf sub-triangles for each state
+    state_counts = Counter()
+    pos = [0]
+
+    def read_state(depth=0):
+        if pos[0] + 2 > len(bits):
+            return
+        # Read 2-bit state (LSB first: bit0 + bit1*2)
+        state = bits[pos[0]] + bits[pos[0] + 1] * 2
+        pos[0] += 2
+
+        if state == 0:
+            # Subdivided: 4 children follow
+            if depth < 20:
+                for _ in range(4):
+                    read_state(depth + 1)
+        else:
+            state_counts[state] += 1
+
+    read_state()
+
+    if not state_counts:
+        return 0
+
+    # BambuStudio assigns paint states to non-default filaments:
+    # state 1 → first non-default (left-click paint color)
+    # state 2 → last non-default (right-click paint color)
+    # state 3 → middle non-default
+    # For a general mapping, we swap states 2 and 3 to match filament order
+    dominant = state_counts.most_common(1)[0][0]
+    REMAP = {1: 1, 2: 3, 3: 2}
+    return REMAP.get(dominant, dominant)
+
+
+def parse_transform(transform_str):
+    """Parse a 3MF transform string (12 floats, column-major 3x4) into a 4x4 matrix."""
+    t = [float(x) for x in transform_str.split()]
+    mat = np.eye(4)
+    mat[0, 0], mat[1, 0], mat[2, 0] = t[0], t[1], t[2]
+    mat[0, 1], mat[1, 1], mat[2, 1] = t[3], t[4], t[5]
+    mat[0, 2], mat[1, 2], mat[2, 2] = t[6], t[7], t[8]
+    mat[0, 3], mat[1, 3], mat[2, 3] = t[9], t[10], t[11]
+    return mat
+
+
+def get_filament_colors(zip_file):
+    """Extract filament colors from BambuStudio project settings."""
     for name in zip_file.namelist():
-        if name.lower() == "3d/3dmodel.model":
-            return name
-    # Fallback: any .model file
-    for name in zip_file.namelist():
-        if name.lower().endswith(".model"):
-            return name
+        if name.lower() == "metadata/project_settings.config":
+            try:
+                data = zip_file.read(name).decode("utf-8")
+                settings = json.loads(data)
+                hex_colors = settings.get("filament_colour", [])
+                if hex_colors:
+                    return [parse_hex_color(hc) for hc in hex_colors]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
     return None
 
 
-def parse_basematerials(resources_elem):
-    """Parse <basematerials> elements → dict of id → list of RGBA colors."""
-    materials = {}
-
-    for bm_elem in resources_elem.findall(f"{{{NS_CORE}}}basematerials"):
-        bm_id = bm_elem.get("id")
-        colors = []
-        for base in bm_elem.findall(f"{{{NS_CORE}}}base"):
-            display_color = base.get("displaycolor", "#FFFFFFFF")
-            colors.append(parse_hex_color(display_color))
-        materials[bm_id] = colors
-
-    return materials
-
-
-def parse_colorgroups(resources_elem):
-    """Parse <colorgroup> elements → dict of id → list of RGBA colors."""
-    colorgroups = {}
-
-    # Try material extension namespace first, then core
-    for ns in [NS_MATERIAL, NS_CORE]:
-        for cg_elem in resources_elem.findall(f"{{{ns}}}colorgroup"):
-            cg_id = cg_elem.get("id")
-            colors = []
-            for color_elem in cg_elem.findall(f"{{{ns}}}color"):
-                color_val = color_elem.get("color", "#FFFFFFFF")
-                colors.append(parse_hex_color(color_val))
-            if colors:
-                colorgroups[cg_id] = colors
-
-    return colorgroups
-
-
-def parse_object(obj_elem, basematerials, colorgroups):
+def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
     """
-    Parse a single <object> element with type='model' that contains a <mesh>.
-    Returns dict with vertices, faces, face_colors, and object-level defaults.
+    Streaming XML parser for large 3MF model files.
+    Uses iterparse to process elements one at a time without loading
+    the entire DOM into memory.
+    
+    Returns: objects dict, components dict
     """
-    obj_id = obj_elem.get("id")
-    obj_name = obj_elem.get("name", f"Object_{obj_id}")
-    obj_pid = obj_elem.get("pid")       # default property group
-    obj_pindex = obj_elem.get("pindex")  # default property index
+    objects = {}      # obj_id → mesh data dict
+    components = {}   # obj_id → list of component refs
 
-    mesh_elem = obj_elem.find(f"{{{NS_CORE}}}mesh")
-    if mesh_elem is None:
-        return None
+    # State tracking
+    current_obj_id = None
+    current_obj_name = None
+    current_obj_pid = None
+    current_obj_pindex = None
+    in_mesh = False
+    in_vertices = False
+    in_triangles = False
 
-    # --- Parse vertices ---
-    vertices_elem = mesh_elem.find(f"{{{NS_CORE}}}vertices")
     vertices = []
-    if vertices_elem is not None:
-        for v in vertices_elem.findall(f"{{{NS_CORE}}}vertex"):
-            x = float(v.get("x", 0))
-            y = float(v.get("y", 0))
-            z = float(v.get("z", 0))
-            vertices.append([x, y, z])
-    vertices = np.array(vertices, dtype=np.float64)
-
-    # --- Parse triangles and per-triangle color properties ---
-    triangles_elem = mesh_elem.find(f"{{{NS_CORE}}}triangles")
     faces = []
     face_colors = []
-    default_color = [200, 200, 200, 255]  # light gray fallback
 
-    if triangles_elem is not None:
-        for tri in triangles_elem.findall(f"{{{NS_CORE}}}triangle"):
-            v1 = int(tri.get("v1"))
-            v2 = int(tri.get("v2"))
-            v3 = int(tri.get("v3"))
-            faces.append([v1, v2, v3])
+    default_color = [200, 200, 200, 255]
+    default_filament_color = filament_colors[0] if filament_colors else default_color
 
-            # Resolve per-triangle color
-            pid = tri.get("pid", obj_pid)
-            p1 = tri.get("p1")
-            p2 = tri.get("p2")
-            p3 = tri.get("p3")
+    obj_count = 0
+    tri_count = 0
 
-            # Determine the color index — use p1 if available, else object default
-            if p1 is not None:
-                color_index = int(p1)
-            elif obj_pindex is not None:
-                color_index = int(obj_pindex)
-            else:
-                color_index = None
+    for event, elem in ET.iterparse(file_obj, events=("start", "end")):
+        tag = elem.tag
 
-            color = default_color
-            if pid is not None and color_index is not None:
-                # Check basematerials first
-                if pid in basematerials:
-                    mat_list = basematerials[pid]
-                    if 0 <= color_index < len(mat_list):
-                        color = mat_list[color_index]
-                # Then check colorgroups
-                elif pid in colorgroups:
-                    cg_list = colorgroups[pid]
-                    if 0 <= color_index < len(cg_list):
-                        color = cg_list[color_index]
+        # Strip namespace
+        if "}" in tag:
+            tag = tag.split("}", 1)[1]
 
-            face_colors.append(color)
+        if event == "start":
+            if tag == "object":
+                current_obj_id = elem.get("id")
+                current_obj_name = elem.get("name", f"Object_{current_obj_id}")
+                current_obj_pid = elem.get("pid")
+                current_obj_pindex = elem.get("pindex")
+                vertices = []
+                faces = []
+                face_colors = []
+                in_mesh = False
 
-    faces = np.array(faces, dtype=np.int64)
-    face_colors = np.array(face_colors, dtype=np.uint8)
+            elif tag == "mesh":
+                in_mesh = True
 
-    return {
-        "id": obj_id,
-        "name": obj_name,
-        "vertices": vertices,
-        "faces": faces,
-        "face_colors": face_colors,
-        "pid": obj_pid,
-        "pindex": obj_pindex,
-    }
+            elif tag == "vertices":
+                in_vertices = True
+
+            elif tag == "triangles":
+                in_triangles = True
+
+            elif tag == "vertex" and in_vertices:
+                vertices.append([
+                    float(elem.get("x", 0)),
+                    float(elem.get("y", 0)),
+                    float(elem.get("z", 0)),
+                ])
+
+            elif tag == "triangle" and in_triangles:
+                faces.append([
+                    int(elem.get("v1")),
+                    int(elem.get("v2")),
+                    int(elem.get("v3")),
+                ])
+                tri_count += 1
+
+                color = None
+
+                # BambuStudio paint_color
+                paint_color = elem.get("paint_color")
+                if paint_color is not None and filament_colors:
+                    filament_idx = decode_paint_color(paint_color)
+                    if 0 <= filament_idx < len(filament_colors):
+                        color = filament_colors[filament_idx]
+
+                # Standard basematerials / colorgroups
+                if color is None:
+                    pid = elem.get("pid", current_obj_pid)
+                    p1 = elem.get("p1")
+                    color_index = int(p1) if p1 is not None else (int(current_obj_pindex) if current_obj_pindex is not None else None)
+
+                    if pid is not None and color_index is not None:
+                        if pid in basematerials:
+                            mat_list = basematerials[pid]
+                            if 0 <= color_index < len(mat_list):
+                                color = mat_list[color_index]
+                        elif pid in colorgroups:
+                            cg_list = colorgroups[pid]
+                            if 0 <= color_index < len(cg_list):
+                                color = cg_list[color_index]
+
+                if color is None:
+                    color = default_filament_color
+
+                face_colors.append(color)
+
+                # Print progress every 500K triangles
+                if tri_count % 500000 == 0:
+                    print(f"    ... {tri_count:,} triangles parsed")
+
+            elif tag == "component":
+                if current_obj_id not in components:
+                    components[current_obj_id] = []
+                comp_data = {
+                    "objectid": elem.get("objectid"),
+                    "path": elem.get(f"{{{NS_PRODUCTION}}}path", elem.get("path")),
+                }
+                transform_str = elem.get("transform")
+                comp_data["transform"] = parse_transform(transform_str) if transform_str else np.eye(4)
+                components[current_obj_id].append(comp_data)
+
+            elif tag == "basematerials":
+                pass  # handled on end
+
+            elif tag == "base" and elem.getparent if hasattr(elem, 'getparent') else False:
+                pass
+
+        elif event == "end":
+            if tag == "vertices":
+                in_vertices = False
+
+            elif tag == "triangles":
+                in_triangles = False
+
+            elif tag == "mesh":
+                in_mesh = False
+
+            elif tag == "object":
+                if faces:
+                    obj_count += 1
+                    objects[current_obj_id] = {
+                        "id": current_obj_id,
+                        "name": current_obj_name,
+                        "vertices": np.array(vertices, dtype=np.float64),
+                        "faces": np.array(faces, dtype=np.int64),
+                        "face_colors": np.array(face_colors, dtype=np.uint8),
+                    }
+                    print(f"    Object '{current_obj_name}': {len(faces):,} triangles, {len(vertices):,} vertices")
+                current_obj_id = None
+                vertices = []
+                faces = []
+                face_colors = []
+
+            elif tag == "basematerials":
+                # Parse basematerials from the element
+                bm_id = elem.get("id")
+                colors = []
+                for base in elem.findall(f"{{{NS_CORE}}}base"):
+                    display_color = base.get("displaycolor", "#FFFFFFFF")
+                    colors.append(parse_hex_color(display_color))
+                # Also try without namespace
+                if not colors:
+                    for base in elem.findall("base"):
+                        display_color = base.get("displaycolor", "#FFFFFFFF")
+                        colors.append(parse_hex_color(display_color))
+                if colors:
+                    basematerials[bm_id] = colors
+
+            elif tag == "colorgroup":
+                cg_id = elem.get("id")
+                colors = []
+                for c in elem.findall(f"{{{NS_MATERIAL}}}color"):
+                    colors.append(parse_hex_color(c.get("color", "#FFFFFFFF")))
+                if not colors:
+                    for c in elem.findall(f"{{{NS_CORE}}}color"):
+                        colors.append(parse_hex_color(c.get("color", "#FFFFFFFF")))
+                if not colors:
+                    for c in elem.findall("color"):
+                        colors.append(parse_hex_color(c.get("color", "#FFFFFFFF")))
+                if colors:
+                    colorgroups[cg_id] = colors
+
+            # Free memory for processed elements
+            elem.clear()
+
+    print(f"    Parsed {obj_count} object(s), {tri_count:,} total triangles")
+    return objects, components
 
 
-def parse_components(obj_elem):
-    """Parse <components> within an object → list of {objectid, transform}."""
-    components = []
-    comps_elem = obj_elem.find(f"{{{NS_CORE}}}components")
-    if comps_elem is None:
-        return components
+def parse_main_model(xml_data):
+    """Parse the main 3dmodel.model to get build items and top-level components."""
+    root = ET.fromstring(xml_data)
+    
+    components = {}
+    resources_elem = root.find(f"{{{NS_CORE}}}resources")
+    if resources_elem is not None:
+        for obj_elem in resources_elem.findall(f"{{{NS_CORE}}}object"):
+            obj_id = obj_elem.get("id")
+            comps_elem = obj_elem.find(f"{{{NS_CORE}}}components")
+            if comps_elem is not None:
+                comp_list = []
+                for comp in comps_elem.findall(f"{{{NS_CORE}}}component"):
+                    comp_data = {
+                        "objectid": comp.get("objectid"),
+                        "path": comp.get(f"{{{NS_PRODUCTION}}}path", comp.get("path")),
+                    }
+                    transform_str = comp.get("transform")
+                    comp_data["transform"] = parse_transform(transform_str) if transform_str else np.eye(4)
+                    comp_list.append(comp_data)
+                components[obj_id] = comp_list
 
-    for comp in comps_elem.findall(f"{{{NS_CORE}}}component"):
-        comp_data = {"objectid": comp.get("objectid")}
-        transform_str = comp.get("transform")
-        if transform_str:
-            t = [float(x) for x in transform_str.split()]
-            # 3MF transform is column-major 3x4 → build 4x4 matrix
-            mat = np.eye(4)
-            mat[0, 0], mat[1, 0], mat[2, 0] = t[0], t[1], t[2]
-            mat[0, 1], mat[1, 1], mat[2, 1] = t[3], t[4], t[5]
-            mat[0, 2], mat[1, 2], mat[2, 2] = t[6], t[7], t[8]
-            mat[0, 3], mat[1, 3], mat[2, 3] = t[9], t[10], t[11]
-            comp_data["transform"] = mat
-        else:
-            comp_data["transform"] = np.eye(4)
-        components.append(comp_data)
+    build_items = []
+    build_elem = root.find(f"{{{NS_CORE}}}build")
+    if build_elem is not None:
+        for item in build_elem.findall(f"{{{NS_CORE}}}item"):
+            bi = {"objectid": item.get("objectid")}
+            transform_str = item.get("transform")
+            bi["transform"] = parse_transform(transform_str) if transform_str else np.eye(4)
+            build_items.append(bi)
 
-    return components
+    # Also get basematerials/colorgroups from main model
+    basematerials = {}
+    colorgroups = {}
+    if resources_elem is not None:
+        for bm_elem in resources_elem.findall(f"{{{NS_CORE}}}basematerials"):
+            bm_id = bm_elem.get("id")
+            colors = []
+            for base in bm_elem.findall(f"{{{NS_CORE}}}base"):
+                colors.append(parse_hex_color(base.get("displaycolor", "#FFFFFFFF")))
+            if colors:
+                basematerials[bm_id] = colors
 
-
-def resolve_object(obj_id, objects_data, basematerials, colorgroups, transform=None):
-    """
-    Recursively resolve an object — if it has components, resolve each,
-    applying transforms. Returns list of trimesh.Trimesh objects.
-    """
-    if transform is None:
-        transform = np.eye(4)
-
-    obj_elem = objects_data.get(obj_id)
-    if obj_elem is None:
-        return []
-
-    meshes = []
-
-    # Check if this object has a direct mesh
-    mesh_data = parse_object(obj_elem, basematerials, colorgroups)
-    if mesh_data is not None and len(mesh_data["faces"]) > 0:
-        mesh = trimesh.Trimesh(
-            vertices=mesh_data["vertices"],
-            faces=mesh_data["faces"],
-            face_colors=mesh_data["face_colors"],
-            process=False,
-        )
-        mesh.apply_transform(transform)
-        mesh.metadata["name"] = mesh_data["name"]
-        meshes.append(mesh)
-
-    # Check if this object has components (assembly)
-    components = parse_components(obj_elem)
-    for comp in components:
-        child_id = comp["objectid"]
-        child_transform = transform @ comp["transform"]
-        child_meshes = resolve_object(
-            child_id, objects_data, basematerials, colorgroups, child_transform
-        )
-        meshes.extend(child_meshes)
-
-    return meshes
+    return build_items, components, basematerials, colorgroups
 
 
 def convert_3mf_to_glb(input_path, output_path=None):
-    """
-    Main conversion function.
-    Opens a 3MF file, extracts mesh + color data, and exports as GLB.
-    """
+    """Main conversion function."""
     if output_path is None:
         base = os.path.splitext(input_path)[0]
         output_path = base + ".glb"
 
     print(f"Opening: {input_path}")
 
-    # --- Open and extract 3MF ---
     with zipfile.ZipFile(input_path, "r") as zf:
-        model_file = find_model_xml(zf)
-        if model_file is None:
-            print("ERROR: No 3D model XML found in 3MF archive.")
-            print(f"  Archive contents: {zf.namelist()}")
+        # --- Detect filament colors ---
+        filament_colors = get_filament_colors(zf)
+        if filament_colors:
+            print(f"  BambuStudio filament colors:")
+            for i, c in enumerate(filament_colors):
+                print(f"    Filament {i+1}: #{c[0]:02X}{c[1]:02X}{c[2]:02X}")
+
+        # --- Find model files ---
+        model_files = []
+        main_model_name = None
+        for name in zf.namelist():
+            if name.lower().endswith(".model"):
+                model_files.append(name)
+                if name.lower() == "3d/3dmodel.model":
+                    main_model_name = name
+
+        if not model_files:
+            print("ERROR: No model files found.")
             return False
 
-        print(f"  Found model: {model_file}")
-        xml_data = zf.read(model_file)
+        print(f"  Found {len(model_files)} model file(s)")
+        for name in model_files:
+            info = zf.getinfo(name)
+            size_mb = info.file_size / (1024 * 1024)
+            print(f"    {name} ({size_mb:.1f} MB)")
 
-    # --- Parse XML ---
-    root = ET.fromstring(xml_data)
+        # --- Parse main model for build items and components ---
+        main_build_items = []
+        main_components = {}
+        basematerials = {}
+        colorgroups = {}
 
-    # Handle namespace — the root element might use the core namespace
-    resources_elem = root.find(f"{{{NS_CORE}}}resources")
-    build_elem = root.find(f"{{{NS_CORE}}}build")
+        if main_model_name:
+            print(f"  Parsing {main_model_name}...")
+            main_xml = zf.read(main_model_name).decode("utf-8")
+            main_build_items, main_components, basematerials, colorgroups = parse_main_model(main_xml)
+            print(f"    {len(main_build_items)} build item(s), {len(main_components)} component group(s)")
 
-    if resources_elem is None:
-        print("ERROR: No <resources> element found in model XML.")
-        return False
+        # --- Parse sub-model files (streaming for large files) ---
+        all_objects = {}
+        sub_components = {}
 
-    if build_elem is None:
-        print("ERROR: No <build> element found in model XML.")
-        return False
+        for model_name in model_files:
+            if model_name == main_model_name:
+                continue
 
-    # --- Parse materials and color groups ---
-    basematerials = parse_basematerials(resources_elem)
-    colorgroups = parse_colorgroups(resources_elem)
+            print(f"  Parsing {model_name} (streaming)...")
+            with zf.open(model_name) as f:
+                objects, comps = stream_parse_model(
+                    f, basematerials, colorgroups, filament_colors
+                )
+                for obj_id, obj_data in objects.items():
+                    all_objects[(model_name, obj_id)] = obj_data
+                sub_components.update(comps)
 
-    print(f"  Found {len(basematerials)} basematerial group(s)")
-    print(f"  Found {len(colorgroups)} color group(s)")
+        # Also parse main model objects if it has meshes directly
+        if main_model_name and main_model_name not in [n for n in model_files if n != main_model_name]:
+            # Check if main model has direct mesh objects
+            main_xml_bytes = zf.read(main_model_name)
+            with io.BytesIO(main_xml_bytes) as f:
+                objects, comps = stream_parse_model(
+                    f, basematerials, colorgroups, filament_colors
+                )
+                for obj_id, obj_data in objects.items():
+                    all_objects[("main", obj_id)] = obj_data
+                sub_components.update(comps)
 
-    # Print color details
-    for bm_id, colors in basematerials.items():
-        print(f"    basematerials[{bm_id}]: {len(colors)} color(s)")
-    for cg_id, colors in colorgroups.items():
-        print(f"    colorgroup[{cg_id}]: {len(colors)} color(s)")
+        print(f"  Total: {len(basematerials)} basematerial group(s), {len(colorgroups)} color group(s)")
 
-    # --- Index all objects by ID ---
-    objects_data = {}
-    for obj_elem in resources_elem.findall(f"{{{NS_CORE}}}object"):
-        obj_id = obj_elem.get("id")
-        objects_data[obj_id] = obj_elem
-
-    print(f"  Found {len(objects_data)} object(s)")
-
-    # --- Resolve build items ---
+    # --- Resolve build items → meshes ---
     all_meshes = []
-    build_items = build_elem.findall(f"{{{NS_CORE}}}item")
 
-    for item in build_items:
-        item_obj_id = item.get("objectid")
-        transform_str = item.get("transform")
+    def resolve(path, obj_id, transform):
+        """Recursively resolve objects and components."""
+        # Look for mesh data
+        obj_data = all_objects.get((path, obj_id))
+        if obj_data is None:
+            # Try normalized path
+            for key, data in all_objects.items():
+                if key[1] == obj_id:
+                    obj_data = data
+                    break
 
-        item_transform = np.eye(4)
-        if transform_str:
-            t = [float(x) for x in transform_str.split()]
-            item_transform[0, 0], item_transform[1, 0], item_transform[2, 0] = t[0], t[1], t[2]
-            item_transform[0, 1], item_transform[1, 1], item_transform[2, 1] = t[3], t[4], t[5]
-            item_transform[0, 2], item_transform[1, 2], item_transform[2, 2] = t[6], t[7], t[8]
-            item_transform[0, 3], item_transform[1, 3], item_transform[2, 3] = t[9], t[10], t[11]
+        if obj_data is not None:
+            mesh = trimesh.Trimesh(
+                vertices=obj_data["vertices"],
+                faces=obj_data["faces"],
+                face_colors=obj_data["face_colors"],
+                process=False,
+            )
+            mesh.apply_transform(transform)
+            mesh.metadata["name"] = obj_data["name"]
+            all_meshes.append(mesh)
 
-        meshes = resolve_object(
-            item_obj_id, objects_data, basematerials, colorgroups, item_transform
-        )
-        all_meshes.extend(meshes)
+        # Check components from main model
+        comp_list = main_components.get(obj_id) or sub_components.get(obj_id)
+        if comp_list:
+            for comp in comp_list:
+                child_id = comp["objectid"]
+                child_path = comp.get("path")
+                child_transform = transform @ comp["transform"]
+
+                if child_path:
+                    child_path = child_path.lstrip("/")
+                else:
+                    child_path = path
+
+                resolve(child_path, child_id, child_transform)
+
+    if main_build_items:
+        for bi in main_build_items:
+            resolve("3D/3dmodel.model", bi["objectid"], bi["transform"])
+    else:
+        for (path, obj_id), obj_data in all_objects.items():
+            mesh = trimesh.Trimesh(
+                vertices=obj_data["vertices"],
+                faces=obj_data["faces"],
+                face_colors=obj_data["face_colors"],
+                process=False,
+            )
+            mesh.metadata["name"] = obj_data["name"]
+            all_meshes.append(mesh)
 
     if not all_meshes:
-        print("ERROR: No meshes found in 3MF file.")
+        print("ERROR: No meshes found.")
         return False
 
-    print(f"  Resolved {len(all_meshes)} mesh(es) total")
+    print(f"  Resolved {len(all_meshes)} mesh(es)")
 
-    # --- Prepare meshes for GLB export ---
-    # Unmerge faces so each triangle has its own vertices → sharp per-face colors
+    # --- Unmerge faces for sharp per-face colors ---
+    print("  Preparing meshes for GLB export...")
     prepared_meshes = []
     total_faces = 0
     total_vertices = 0
 
     for mesh in all_meshes:
         total_faces += len(mesh.faces)
-
-        # Store face colors before unmerging
         fc = mesh.visual.face_colors.copy()
 
-        # Unmerge: duplicate shared vertices so each face has unique vertex set
-        # This prevents color interpolation at shared edges
         new_vertices = mesh.vertices[mesh.faces.flatten()]
         new_faces = np.arange(len(new_vertices)).reshape(-1, 3)
-
-        # Expand face colors → vertex colors (repeat each face color 3 times)
         vertex_colors = np.repeat(fc, 3, axis=0)
 
         new_mesh = trimesh.Trimesh(
@@ -336,7 +512,6 @@ def convert_3mf_to_glb(input_path, output_path=None):
             vertex_colors=vertex_colors,
             process=False,
         )
-
         if hasattr(mesh, "metadata") and "name" in mesh.metadata:
             new_mesh.metadata["name"] = mesh.metadata["name"]
 
@@ -344,46 +519,43 @@ def convert_3mf_to_glb(input_path, output_path=None):
         prepared_meshes.append(new_mesh)
 
     print(f"  Total triangles: {total_faces:,}")
-    print(f"  Total vertices (after unmerge): {total_vertices:,}")
+    print(f"  Total vertices: {total_vertices:,}")
 
-    # --- Build scene and export GLB ---
-    if len(prepared_meshes) == 1:
-        scene = trimesh.Scene(geometry={"model": prepared_meshes[0]})
-    else:
-        geometry = {}
-        for i, mesh in enumerate(prepared_meshes):
-            name = mesh.metadata.get("name", f"part_{i}") if hasattr(mesh, "metadata") else f"part_{i}"
-            # Ensure unique names
-            if name in geometry:
-                name = f"{name}_{i}"
-            geometry[name] = mesh
-        scene = trimesh.Scene(geometry=geometry)
+    # --- Export GLB ---
+    print("  Exporting GLB...")
+    geometry = {}
+    for i, mesh in enumerate(prepared_meshes):
+        name = mesh.metadata.get("name", f"part_{i}") if hasattr(mesh, "metadata") else f"part_{i}"
+        if name in geometry:
+            name = f"{name}_{i}"
+        geometry[name] = mesh
 
-    # Export
+    scene = trimesh.Scene(geometry=geometry)
     glb_data = scene.export(file_type="glb")
 
     with open(output_path, "wb") as f:
         f.write(glb_data)
 
     file_size = os.path.getsize(output_path)
-    size_str = f"{file_size / 1024:.1f} KB" if file_size < 1024 * 1024 else f"{file_size / (1024*1024):.1f} MB"
+    if file_size < 1024:
+        size_str = f"{file_size} bytes"
+    elif file_size < 1024 * 1024:
+        size_str = f"{file_size / 1024:.1f} KB"
+    else:
+        size_str = f"{file_size / (1024*1024):.1f} MB"
 
     print(f"\nSaved: {output_path} ({size_str})")
     return True
 
 
 def main():
-    """Entry point — handles CLI args, drag-and-drop, and file picker."""
     if len(sys.argv) >= 2:
-        # CLI or drag-and-drop mode
         input_path = sys.argv[1]
         output_path = sys.argv[2] if len(sys.argv) >= 3 else None
     else:
-        # No arguments — open file picker
         try:
             import tkinter as tk
             from tkinter import filedialog
-
             root = tk.Tk()
             root.withdraw()
             input_path = filedialog.askopenfilename(
@@ -391,27 +563,19 @@ def main():
                 filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
             )
             root.destroy()
-
             if not input_path:
                 print("No file selected.")
                 return
         except ImportError:
             print("Usage: converter.py <input.3mf> [output.glb]")
-            print("  Or drag a .3mf file onto this executable.")
             return
-
         output_path = None
 
-    # Validate input
     if not os.path.isfile(input_path):
         print(f"ERROR: File not found: {input_path}")
         input("Press Enter to exit...")
         return
 
-    if not input_path.lower().endswith(".3mf"):
-        print(f"WARNING: File does not have .3mf extension: {input_path}")
-
-    # Convert
     print("=" * 50)
     print("  3MF to GLB Converter")
     print("=" * 50)
@@ -423,7 +587,6 @@ def main():
     else:
         print("\nConversion failed.")
 
-    # Keep window open if running as exe (drag-and-drop)
     if getattr(sys, "frozen", False):
         input("\nPress Enter to exit...")
 
