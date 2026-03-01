@@ -682,17 +682,24 @@ def process_file(input_path, output_path=None):
         print(f"ERROR: File not found: {input_path}")
         return False
 
+    import os
     print("=" * 50)
     print(f"  Converting: {os.path.basename(input_path)}")
     print("=" * 50)
 
-    success = convert_3mf_to_glb(input_path, output_path)
+    try:
+        success = convert_3mf_to_glb(input_path, output_path)
 
-    if success:
-        print("\nConversion complete!")
-    else:
-        print("\nConversion failed.")
-    return success
+        if success:
+            print(f"\n✅ Conversion complete for {os.path.basename(input_path)}!")
+        else:
+            print(f"\n❌ Conversion failed for {os.path.basename(input_path)}.")
+        return success
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"\n❌ Exception during conversion for {os.path.basename(input_path)}.")
+        return False
 
 class GUI:
     def __init__(self, root):
@@ -735,12 +742,21 @@ class GUI:
         self.input_paths = []
         
     def log(self, text):
+        # Schedule the UI update on the main thread safely
+        self.root.after(0, self._append_log, text)
+        
+    def _append_log(self, text):
         import tkinter as tk
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, text + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
-        self.root.update()
+
+    def _update_listbox(self, index, text):
+        self.listbox.delete(index)
+        self.listbox.insert(index, text)
+        # Keep the updated item visible
+        self.listbox.see(index)
 
     def add_files(self):
         import tkinter as tk
@@ -770,10 +786,16 @@ class GUI:
             return
         
         self.convert_btn.configure(state=tk.DISABLED)
+        # Reset the view text in case we are running it again
+        import os
+        for i, path in enumerate(self.input_paths):
+            self._update_listbox(i, os.path.basename(path))
+            
         threading.Thread(target=self.run_conversion, daemon=True).start()
 
     def run_conversion(self):
-        import tkinter as tk
+        import sys
+        import os
         # Redirect stdout to the log widget
         old_stdout = sys.stdout
         class StdoutRedirector:
@@ -799,8 +821,15 @@ class GUI:
             for i, path in enumerate(self.input_paths):
                 if i > 0:
                     print("\n")
+                
+                filename = os.path.basename(path)
+                self.root.after(0, lambda idx=i, name=filename: self._update_listbox(idx, f"⏳ [Processing] {name}"))
+
                 if process_file(path, None):
                     success_count += 1
+                    self.root.after(0, lambda idx=i, name=filename: self._update_listbox(idx, f"✅ [Done] {name}"))
+                else:
+                    self.root.after(0, lambda idx=i, name=filename: self._update_listbox(idx, f"❌ [Failed] {name}"))
                     
             print("\n" + "=" * 50)
             print(f"Finished processing {len(self.input_paths)} file(s).")
