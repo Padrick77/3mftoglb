@@ -677,36 +677,13 @@ def convert_3mf_to_glb(input_path, output_path=None):
     return True
 
 
-def main():
-    if len(sys.argv) >= 2:
-        input_path = sys.argv[1]
-        output_path = sys.argv[2] if len(sys.argv) >= 3 else None
-    else:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            input_path = filedialog.askopenfilename(
-                title="Select 3MF File",
-                filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
-            )
-            root.destroy()
-            if not input_path:
-                print("No file selected.")
-                return
-        except ImportError:
-            print("Usage: converter.py <input.3mf> [output.glb]")
-            return
-        output_path = None
-
+def process_file(input_path, output_path=None):
     if not os.path.isfile(input_path):
         print(f"ERROR: File not found: {input_path}")
-        input("Press Enter to exit...")
-        return
+        return False
 
     print("=" * 50)
-    print("  3MF to GLB Converter")
+    print(f"  Converting: {os.path.basename(input_path)}")
     print("=" * 50)
 
     success = convert_3mf_to_glb(input_path, output_path)
@@ -715,6 +692,68 @@ def main():
         print("\nConversion complete!")
     else:
         print("\nConversion failed.")
+    return success
+
+def main():
+    input_paths = []
+    output_path_override = None
+
+    if len(sys.argv) > 1:
+        # Check if first argument is a directory
+        if len(sys.argv) == 2 and os.path.isdir(sys.argv[1]):
+            directory = sys.argv[1]
+            for file in os.listdir(directory):
+                if file.lower().endswith(".3mf"):
+                    input_paths.append(os.path.join(directory, file))
+        else:
+            # Handle multiple dragged files or explicit file paths
+            for arg in sys.argv[1:]:
+                # Check for an output override (only valid if 1 input file and second arg isn't a 3mf)
+                if not arg.lower().endswith(".3mf") and len(input_paths) == 1 and len(sys.argv) == 3:
+                     output_path_override = arg
+                     continue
+                     
+                if os.path.isfile(arg) and arg.lower().endswith(".3mf"):
+                    input_paths.append(arg)
+    else:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            file_paths = filedialog.askopenfilenames(
+                title="Select 3MF Files",
+                filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
+            )
+            root.destroy()
+            if not file_paths:
+                print("No files selected.")
+                return
+            input_paths = list(file_paths)
+        except ImportError:
+            print("Usage: converter.py <input1.3mf> [input2.3mf...] OR directory")
+            return
+
+    if not input_paths:
+        print("ERROR: No 3MF files provided or found.")
+        if getattr(sys, "frozen", False):
+            input("Press Enter to exit...")
+        return
+
+    print(f"Found {len(input_paths)} file(s) to process.")
+    
+    success_count = 0
+    for i, path in enumerate(input_paths):
+        if i > 0:
+            print("\n")
+        out_path = output_path_override if len(input_paths) == 1 else None
+        if process_file(path, out_path):
+            success_count += 1
+
+    print("\n" + "=" * 50)
+    print(f"Finished processing {len(input_paths)} file(s).")
+    print(f"Successful: {success_count} | Failed: {len(input_paths) - success_count}")
+    print("=" * 50)
 
     if getattr(sys, "frozen", False):
         input("\nPress Enter to exit...")
