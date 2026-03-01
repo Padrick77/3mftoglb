@@ -421,7 +421,7 @@ def parse_main_model(xml_data):
     return build_items, components, basematerials, colorgroups
 
 
-def convert_3mf_to_glb(input_path, output_path=None):
+def convert_3mf_to_glb(input_path, output_path=None, extract_glb=True, extract_thumbnails=True):
     """Main conversion function."""
     if output_path is None:
         base = os.path.splitext(input_path)[0]
@@ -430,6 +430,21 @@ def convert_3mf_to_glb(input_path, output_path=None):
     print(f"Opening: {input_path}")
 
     with zipfile.ZipFile(input_path, "r") as zf:
+        # --- Extract Thumbnails ---
+        if extract_thumbnails:
+            for filename in zf.namelist():
+                if filename.lower().endswith(".png"):
+                    img_data = zf.read(filename)
+                    # Ensure the name is unique but ties to the input.
+                    # e.g. "AutumnwingColors_plate_1.png"
+                    img_base = os.path.basename(filename)
+                    base_input_name = os.path.splitext(os.path.basename(input_path))[0]
+                    img_out_path = os.path.join(os.path.dirname(input_path), f"{base_input_name}_{img_base}")
+                    
+                    with open(img_out_path, "wb") as f:
+                        f.write(img_data)
+                    print(f"  Extracted thumbnail: {os.path.basename(img_out_path)}")
+
         # --- Detect filament colors ---
         filament_colors = get_filament_colors(zf)
         if filament_colors:
@@ -449,11 +464,16 @@ def convert_3mf_to_glb(input_path, output_path=None):
                 if name.lower() == "3d/3dmodel.model":
                     main_model_name = name
 
-        if not model_files:
+        if extract_glb and not model_files:
             print("ERROR: No model files found.")
             return False
+            
+        if not extract_glb and not extract_thumbnails:
+            print("ERROR: No output options selected.")
+            return False
 
-        print(f"  Found {len(model_files)} model file(s)")
+        if model_files and extract_glb:
+            print(f"  Found {len(model_files)} model file(s)")
         for name in model_files:
             info = zf.getinfo(name)
             size_mb = info.file_size / (1024 * 1024)
@@ -475,18 +495,19 @@ def convert_3mf_to_glb(input_path, output_path=None):
         all_objects = {}
         sub_components = {}
 
-        for model_name in model_files:
-            if model_name == main_model_name:
-                continue
+        if extract_glb:
+            for model_name in model_files:
+                if model_name == main_model_name:
+                    continue
 
-            print(f"  Parsing {model_name} (streaming)...")
-            with zf.open(model_name) as f:
-                objects, comps = stream_parse_model(
-                    f, basematerials, colorgroups, filament_colors, object_names
-                )
-                for obj_id, obj_data in objects.items():
-                    all_objects[(model_name, obj_id)] = obj_data
-                sub_components.update(comps)
+                print(f"  Parsing {model_name} (streaming)...")
+                with zf.open(model_name) as f:
+                    objects, comps = stream_parse_model(
+                        f, basematerials, colorgroups, filament_colors, object_names
+                    )
+                    for obj_id, obj_data in objects.items():
+                        all_objects[(model_name, obj_id)] = obj_data
+                    sub_components.update(comps)
 
         # Also parse main model objects if it has meshes directly
         if main_model_name and main_model_name not in [n for n in model_files if n != main_model_name]:
@@ -502,6 +523,9 @@ def convert_3mf_to_glb(input_path, output_path=None):
 
         print(f"  Total: {len(basematerials)} basematerial group(s), {len(colorgroups)} color group(s)")
 
+    if not extract_glb:
+        return True
+        
     # --- Resolve build items → meshes ---
     all_meshes = []
 
@@ -651,33 +675,11 @@ def convert_3mf_to_glb(input_path, output_path=None):
     print(f"  Total vertices: {total_vertices:,}")
 
     # --- Export GLB ---
-    print("  Exporting GLB...")
-    geometry = {}
-    for i, mesh in enumerate(prepared_meshes):
-        name = mesh.metadata.get("name", f"part_{i}") if hasattr(mesh, "metadata") else f"part_{i}"
-        if name in geometry:
-            name = f"{name}_{i}"
-        geometry[name] = mesh
-
-    scene = trimesh.Scene(geometry=geometry)
-    glb_data = scene.export(file_type="glb")
-
-    with open(output_path, "wb") as f:
-        f.write(glb_data)
-
-    file_size = os.path.getsize(output_path)
-    if file_size < 1024:
-        size_str = f"{file_size} bytes"
-    elif file_size < 1024 * 1024:
-        size_str = f"{file_size / 1024:.1f} KB"
-    else:
-        size_str = f"{file_size / (1024*1024):.1f} MB"
-
     print(f"\nSaved: {output_path} ({size_str})")
     return True
 
 
-def process_file(input_path, output_path=None):
+def process_file(input_path, output_path=None, extract_glb=True, extract_thumbnails=True):
     if not os.path.isfile(input_path):
         print(f"ERROR: File not found: {input_path}")
         return False
@@ -687,7 +689,7 @@ def process_file(input_path, output_path=None):
     print("=" * 50)
 
     try:
-        success = convert_3mf_to_glb(input_path, output_path)
+        success = convert_3mf_to_glb(input_path, output_path, extract_glb, extract_thumbnails)
 
         if success:
             print(f"\n✅ Conversion complete for {os.path.basename(input_path)}!")
@@ -714,14 +716,26 @@ class GUI:
         # Thread-safe queue for log messages
         self.log_queue = queue.Queue()
 
-        # Top frame - buttons
-        btn_frame = ttk.Frame(root)
-        btn_frame.pack(fill=tk.X, pady=(0, 10))
+        # Top frame - buttons and options
+        top_frame = ttk.Frame(root)
+        top_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        btn_frame = ttk.Frame(top_frame)
+        btn_frame.pack(side=tk.LEFT)
 
         ttk.Button(btn_frame, text="Add 3MF Files", command=self.add_files).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Clear List", command=self.clear_files).pack(side=tk.LEFT, padx=(0, 5))
         
-        self.convert_btn = ttk.Button(btn_frame, text="Convert All", command=self.start_conversion)
+        options_frame = ttk.LabelFrame(top_frame, text="Output Options")
+        options_frame.pack(side=tk.LEFT, padx=(15, 0))
+        
+        self.var_extract_glb = tk.BooleanVar(value=True)
+        self.var_extract_thumbnails = tk.BooleanVar(value=True)
+        
+        ttk.Checkbutton(options_frame, text="GLB File", variable=self.var_extract_glb).pack(side=tk.LEFT, padx=5, pady=2)
+        ttk.Checkbutton(options_frame, text="Thumbnails", variable=self.var_extract_thumbnails).pack(side=tk.LEFT, padx=5, pady=2)
+        
+        self.convert_btn = ttk.Button(top_frame, text="Convert All", command=self.start_conversion)
         self.convert_btn.pack(side=tk.RIGHT)
 
         # Middle frame - file list
@@ -833,7 +847,7 @@ class GUI:
                 filename = os.path.basename(path)
                 self.root.after(0, lambda idx=i, name=filename: self._update_listbox(idx, f"⏳ [Processing] {name}"))
 
-                if process_file(path, None):
+                if process_file(path, None, extract_glb=self.var_extract_glb.get(), extract_thumbnails=self.var_extract_thumbnails.get()):
                     success_count += 1
                     self.root.after(0, lambda idx=i, name=filename: self._update_listbox(idx, f"✅ [Done] {name}"))
                 else:
