@@ -143,7 +143,27 @@ def get_filament_colors(zip_file):
     return None
 
 
-def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
+def get_object_names(zip_file):
+    """Extract proper object names from BambuStudio model settings."""
+    names = {}
+    for name in zip_file.namelist():
+        if name.lower() == "metadata/model_settings.config":
+            try:
+                data = zip_file.read(name).decode("utf-8")
+                # Simple regex extraction to avoid complex XML namespaces
+                import re as _re
+                parts = _re.findall(r'<part id="([^"]+)"[^>]*>.*?<metadata key="name" value="([^"]+)"', data, _re.DOTALL)
+                for part_id, part_name in parts:
+                    if part_name.lower().endswith(".stl") or part_name.lower().endswith(".obj"):
+                        part_name = part_name[:-4]
+                    names[part_id] = part_name
+            except Exception:
+                pass
+            break
+    return names
+
+
+def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors, object_names=None):
     """
     Streaming XML parser for large 3MF model files.
     Uses iterparse to process elements one at a time without loading
@@ -151,6 +171,9 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
     
     Returns: objects dict, components dict
     """
+    if object_names is None:
+        object_names = {}
+
     objects = {}      # obj_id → mesh data dict
     components = {}   # obj_id → list of component refs
 
@@ -162,6 +185,7 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
     in_mesh = False
     in_vertices = False
     in_triangles = False
+    mesh_has_colors = False
 
     vertices = []
     faces = []
@@ -183,12 +207,14 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
         if event == "start":
             if tag == "object":
                 current_obj_id = elem.get("id")
-                current_obj_name = elem.get("name", f"Object_{current_obj_id}")
+                default_name = f"Object_{current_obj_id}"
+                current_obj_name = elem.get("name") or object_names.get(current_obj_id) or default_name
                 current_obj_pid = elem.get("pid")
                 current_obj_pindex = elem.get("pindex")
                 vertices = []
                 faces = []
                 face_colors = []
+                mesh_has_colors = False
                 in_mesh = False
 
             elif tag == "mesh":
@@ -249,7 +275,9 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
                             if 0 <= color_index < len(cg_list):
                                 color = cg_list[color_index]
 
-                if color is None:
+                if color is not None:
+                    mesh_has_colors = True
+                else:
                     color = default_filament_color
 
                 face_colors.append(color)
@@ -293,13 +321,15 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
                         "name": current_obj_name,
                         "vertices": np.array(vertices, dtype=np.float64),
                         "faces": np.array(faces, dtype=np.int64),
-                        "face_colors": np.array(face_colors, dtype=np.uint8),
+                        "face_colors": np.array(face_colors, dtype=np.uint8) if mesh_has_colors else None,
+                        "default_color": default_filament_color,
                     }
                     print(f"    Object '{current_obj_name}': {len(faces):,} triangles, {len(vertices):,} vertices")
                 current_obj_id = None
                 vertices = []
                 faces = []
                 face_colors = []
+                mesh_has_colors = False
 
             elif tag == "basematerials":
                 # Parse basematerials from the element
@@ -379,6 +409,14 @@ def parse_main_model(xml_data):
                 colors.append(parse_hex_color(base.get("displaycolor", "#FFFFFFFF")))
             if colors:
                 basematerials[bm_id] = colors
+        for cg_elem in resources_elem.findall(f"{{{NS_MATERIAL}}}colorgroup"):
+            cg_id = cg_elem.get("id")
+            colors = []
+            for c in cg_elem.findall(f"{{{NS_MATERIAL}}}color"):
+                colors.append(parse_hex_color(c.get("color", "#FFFFFFFF")))
+            if colors:
+                colorgroups[cg_id] = colors
+
 
     return build_items, components, basematerials, colorgroups
 
@@ -398,6 +436,9 @@ def convert_3mf_to_glb(input_path, output_path=None):
             print(f"  BambuStudio filament colors:")
             for i, c in enumerate(filament_colors):
                 print(f"    Filament {i+1}: #{c[0]:02X}{c[1]:02X}{c[2]:02X}")
+
+        # Extract object names from model settings if available
+        object_names = get_object_names(zf)
 
         # --- Find model files ---
         model_files = []
@@ -441,7 +482,7 @@ def convert_3mf_to_glb(input_path, output_path=None):
             print(f"  Parsing {model_name} (streaming)...")
             with zf.open(model_name) as f:
                 objects, comps = stream_parse_model(
-                    f, basematerials, colorgroups, filament_colors
+                    f, basematerials, colorgroups, filament_colors, object_names
                 )
                 for obj_id, obj_data in objects.items():
                     all_objects[(model_name, obj_id)] = obj_data
@@ -453,7 +494,7 @@ def convert_3mf_to_glb(input_path, output_path=None):
             main_xml_bytes = zf.read(main_model_name)
             with io.BytesIO(main_xml_bytes) as f:
                 objects, comps = stream_parse_model(
-                    f, basematerials, colorgroups, filament_colors
+                    f, basematerials, colorgroups, filament_colors, object_names
                 )
                 for obj_id, obj_data in objects.items():
                     all_objects[("main", obj_id)] = obj_data
@@ -476,12 +517,37 @@ def convert_3mf_to_glb(input_path, output_path=None):
                     break
 
         if obj_data is not None:
-            mesh = trimesh.Trimesh(
-                vertices=obj_data["vertices"],
-                faces=obj_data["faces"],
-                face_colors=obj_data["face_colors"],
-                process=False,
-            )
+            vertices = obj_data["vertices"]
+            faces = obj_data["faces"]
+            color_data = obj_data.get("face_colors")
+            
+            if color_data is not None:
+                # We have per-triangle colors, build a mesh with vertex colors
+                face_colors_np = np.array(color_data, dtype=np.uint8)
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=faces,
+                    face_colors=face_colors_np,
+                    process=False
+                )
+                # Unmerge faces so each triangle has unique vertices and sharp colors
+                mesh.unmerge_faces()
+            else:
+                # Uniform uncolored mesh! Use a PBRMaterial instead of baked vertex colors
+                # This allows it to be easily recolored in web viewers via material.color
+                default_color = obj_data.get("default_color", [200, 200, 200, 255])
+                # convert 0-255 to 0.0-1.0
+                base_color = [c / 255.0 for c in default_color]
+                mat = trimesh.visual.material.PBRMaterial(baseColorFactor=base_color)
+                vis = trimesh.visual.TextureVisuals(material=mat)
+                
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=faces,
+                    visual=vis,
+                    process=False
+                )
+
             mesh.apply_transform(transform)
             mesh.metadata["name"] = obj_data["name"]
             all_meshes.append(mesh)
@@ -506,12 +572,37 @@ def convert_3mf_to_glb(input_path, output_path=None):
             resolve("3D/3dmodel.model", bi["objectid"], bi["transform"])
     else:
         for (path, obj_id), obj_data in all_objects.items():
-            mesh = trimesh.Trimesh(
-                vertices=obj_data["vertices"],
-                faces=obj_data["faces"],
-                face_colors=obj_data["face_colors"],
-                process=False,
-            )
+            vertices = obj_data["vertices"]
+            faces = obj_data["faces"]
+            color_data = obj_data.get("face_colors")
+            
+            if color_data is not None:
+                # We have per-triangle colors, build a mesh with vertex colors
+                face_colors_np = np.array(color_data, dtype=np.uint8)
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=faces,
+                    face_colors=face_colors_np,
+                    process=False
+                )
+                # Unmerge faces so each triangle has unique vertices and sharp colors
+                mesh.unmerge_faces()
+            else:
+                # Uniform uncolored mesh! Use a PBRMaterial instead of baked vertex colors
+                # This allows it to be easily recolored in web viewers via material.color
+                default_color = obj_data.get("default_color", [200, 200, 200, 255])
+                # convert 0-255 to 0.0-1.0
+                base_color = [c / 255.0 for c in default_color]
+                mat = trimesh.visual.material.PBRMaterial(baseColorFactor=base_color)
+                vis = trimesh.visual.TextureVisuals(material=mat)
+                
+                mesh = trimesh.Trimesh(
+                    vertices=vertices,
+                    faces=faces,
+                    visual=vis,
+                    process=False
+                )
+
             mesh.metadata["name"] = obj_data["name"]
             all_meshes.append(mesh)
 
@@ -529,22 +620,31 @@ def convert_3mf_to_glb(input_path, output_path=None):
 
     for mesh in all_meshes:
         total_faces += len(mesh.faces)
-        fc = mesh.visual.face_colors.copy()
+        
+        # If the mesh already has a PBRMaterial, it means it was uncolored
+        # and we don't need to unmerge faces or set vertex colors.
+        if isinstance(mesh.visual, trimesh.visual.TextureVisuals) and isinstance(mesh.visual.material, trimesh.visual.material.PBRMaterial):
+            new_mesh = mesh
+        else:
+            # Otherwise, it has face_colors (or default colors baked in)
+            # and we need to unmerge for sharp per-face colors.
+            fc = mesh.visual.face_colors.copy()
 
-        new_vertices = mesh.vertices[mesh.faces.flatten()]
-        new_faces = np.arange(len(new_vertices)).reshape(-1, 3)
-        vertex_colors = np.repeat(fc, 3, axis=0)
+            new_vertices = mesh.vertices[mesh.faces.flatten()]
+            new_faces = np.arange(len(new_vertices)).reshape(-1, 3)
+            vertex_colors = np.repeat(fc, 3, axis=0)
 
-        new_mesh = trimesh.Trimesh(
-            vertices=new_vertices,
-            faces=new_faces,
-            vertex_colors=vertex_colors,
-            process=False,
-        )
+            new_mesh = trimesh.Trimesh(
+                vertices=new_vertices,
+                faces=new_faces,
+                vertex_colors=vertex_colors,
+                process=False,
+            )
+        
         if hasattr(mesh, "metadata") and "name" in mesh.metadata:
             new_mesh.metadata["name"] = mesh.metadata["name"]
 
-        total_vertices += len(new_vertices)
+        total_vertices += len(new_mesh.vertices)
         prepared_meshes.append(new_mesh)
 
     print(f"  Total triangles: {total_faces:,}")
