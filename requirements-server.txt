@@ -4,3 +4,5 @@ pygltflib
 fastapi
 uvicorn
 python-multipart
+pyrender
+pyglet<2

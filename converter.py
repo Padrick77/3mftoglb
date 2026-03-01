@@ -421,6 +421,69 @@ def parse_main_model(xml_data):
     return build_items, components, basematerials, colorgroups
 
 
+def convert_stl_to_glb(input_path, output_path=None, extract_glb=True, extract_thumbnails=False):
+    """Convert STL to GLB."""
+    if not extract_glb and not extract_thumbnails:
+        return True
+        
+    if output_path is None:
+        base = os.path.splitext(input_path)[0]
+        output_path = base + ".glb"
+
+    print(f"Opening: {input_path}")
+    try:
+        # force="mesh" ensures it loads as Trimesh even if it's multiple parts
+        mesh = trimesh.load(input_path, force="mesh")
+        
+        # Apply a default neutral gray material
+        base_color = [200 / 255.0, 200 / 255.0, 200 / 255.0, 1.0]
+        mat = trimesh.visual.material.PBRMaterial(baseColorFactor=base_color)
+        vis = trimesh.visual.TextureVisuals(material=mat)
+        
+        new_mesh = trimesh.Trimesh(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            visual=vis,
+            process=False
+        )
+        
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        new_mesh.metadata["name"] = base_name
+            
+        scene = trimesh.Scene([new_mesh])
+        
+        if extract_thumbnails:
+            try:
+                # Basic thumbnail generation using trimesh's built-in save_image
+                # which uses pyrender under the hood if available
+                img_out_path = os.path.join(os.path.dirname(input_path), f"{base_name}_thumbnail.png")
+                
+                # Setup a camera looking at the model
+                scene.set_camera()
+                
+                # Render the image
+                png_data = scene.save_image(resolution=[512, 512], visible=True)
+                
+                with open(img_out_path, "wb") as f:
+                    f.write(png_data)
+                print(f"  Extracted thumbnail: {os.path.basename(img_out_path)}")
+            except Exception as e:
+                print(f"  Warning: Could not generate thumbnail: {e}")
+                
+        if extract_glb:
+            scene.export(output_path)
+            print(f"  Total triangles: {len(mesh.faces):,}")
+            print(f"  Total vertices: {len(mesh.vertices):,}")
+            print(f"\nSaved: {output_path}")
+            
+        return True
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"ERROR converting STL: {e}")
+        return False
+
+
 def convert_3mf_to_glb(input_path, output_path=None, extract_glb=True, extract_thumbnails=True):
     """Main conversion function."""
     if output_path is None:
@@ -697,7 +760,11 @@ def process_file(input_path, output_path=None, extract_glb=True, extract_thumbna
     print("=" * 50)
 
     try:
-        success = convert_3mf_to_glb(input_path, output_path, extract_glb, extract_thumbnails)
+        ext = os.path.splitext(input_path)[1].lower()
+        if ext == ".stl":
+            success = convert_stl_to_glb(input_path, output_path, extract_glb, extract_thumbnails)
+        else:
+            success = convert_3mf_to_glb(input_path, output_path, extract_glb, extract_thumbnails)
 
         if success:
             print(f"\n✅ Conversion complete for {os.path.basename(input_path)}!")
@@ -713,7 +780,7 @@ def process_file(input_path, output_path=None, extract_glb=True, extract_thumbna
 class GUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("3MF to GLB Converter")
+        self.root.title("3MF/STL to GLB Converter")
         self.root.geometry("700x500")
         self.root.configure(padx=10, pady=10)
 
@@ -731,7 +798,7 @@ class GUI:
         btn_frame = ttk.Frame(top_frame)
         btn_frame.pack(side=tk.LEFT)
 
-        ttk.Button(btn_frame, text="Add 3MF Files", command=self.add_files).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Add 3D Models", command=self.add_files).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Clear List", command=self.clear_files).pack(side=tk.LEFT, padx=(0, 5))
         
         options_frame = ttk.LabelFrame(top_frame, text="Output Options")
@@ -797,8 +864,8 @@ class GUI:
         import tkinter as tk
         from tkinter import filedialog
         file_paths = filedialog.askopenfilenames(
-            title="Select 3MF Files",
-            filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
+            title="Select 3D Models",
+            filetypes=[("3D Models", "*.3mf *.stl"), ("3MF Files", "*.3mf"), ("STL Files", "*.stl"), ("All Files", "*.*")],
         )
         for p in file_paths:
             if p not in self.input_paths:
@@ -883,18 +950,18 @@ def main():
         if len(sys.argv) == 2 and os.path.isdir(sys.argv[1]):
             directory = sys.argv[1]
             for file in os.listdir(directory):
-                if file.lower().endswith(".3mf"):
+                if file.lower().endswith((".3mf", ".stl")):
                     input_paths.append(os.path.join(directory, file))
         else:
             for arg in sys.argv[1:]:
-                if not arg.lower().endswith(".3mf") and len(input_paths) == 1 and len(sys.argv) == 3:
+                if not arg.lower().endswith((".3mf", ".stl")) and len(input_paths) == 1 and len(sys.argv) == 3:
                      output_path_override = arg
                      continue
-                if os.path.isfile(arg) and arg.lower().endswith(".3mf"):
+                if os.path.isfile(arg) and arg.lower().endswith((".3mf", ".stl")):
                     input_paths.append(arg)
 
         if not input_paths:
-            print("ERROR: No 3MF files provided or found.")
+            print("ERROR: No 3MF or STL files provided or found.")
             if getattr(sys, "frozen", False):
                 try:
                     input("Press Enter to exit...")
@@ -930,7 +997,7 @@ def main():
             gui = GUI(root)
             root.mainloop()
         except ImportError:
-            print("Tkinter not available. Usage: converter.py <input1.3mf> [input2.3mf...] OR directory")
+            print("Tkinter not available. Usage: converter.py <input1.3mf/stl> [input2.3mf/stl...] OR directory")
 
 if __name__ == "__main__":
     main()

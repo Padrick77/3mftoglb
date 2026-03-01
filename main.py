@@ -7,7 +7,7 @@ import shutil
 import asyncio
 from converter import convert_3mf_to_glb
 
-app = FastAPI(title="3MF to GLB Converter API", description="API to convert 3MF models to GLB for web viewing.")
+app = FastAPI(title="3MF/STL to GLB Converter API", description="API to convert 3MF/STL models to GLB for web viewing.")
 
 # Enable CORS for the frontend website to make requests to this API
 app.add_middleware(
@@ -20,8 +20,8 @@ app.add_middleware(
 
 @app.post("/convert")
 async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".3mf"):
-        raise HTTPException(status_code=400, detail="File must be a .3mf file")
+    if not file.filename.lower().endswith((".3mf", ".stl")):
+        raise HTTPException(status_code=400, detail="File must be a .3mf or .stl file")
         
     # Create temp directory to avoid filename collisions across concurrent requests
     temp_dir = tempfile.mkdtemp()
@@ -39,14 +39,26 @@ async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = Fil
             
         # Run conversion in a separate thread so it doesn't block the ASGI event loop
         loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(
-            None, 
-            convert_3mf_to_glb, 
-            input_path, 
-            output_path, 
-            True,   # extract_glb
-            False   # extract_thumbnails
-        )
+        ext = os.path.splitext(input_filename)[1].lower()
+        if ext == ".stl":
+            from converter import convert_stl_to_glb
+            success = await loop.run_in_executor(
+                None, 
+                convert_stl_to_glb, 
+                input_path, 
+                output_path, 
+                True,   # extract_glb
+                False   # extract_thumbnails
+            )
+        else:
+            success = await loop.run_in_executor(
+                None, 
+                convert_3mf_to_glb, 
+                input_path, 
+                output_path, 
+                True,   # extract_glb
+                False   # extract_thumbnails
+            )
         
         if not success or not os.path.exists(output_path):
             raise Exception("Conversion returned false or produced no output file")
