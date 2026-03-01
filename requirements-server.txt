@@ -1,0 +1,6 @@
+trimesh
+numpy
+pygltflib
+fastapi
+uvicorn
+python-multipart
