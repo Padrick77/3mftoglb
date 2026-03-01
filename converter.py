@@ -694,70 +694,174 @@ def process_file(input_path, output_path=None):
         print("\nConversion failed.")
     return success
 
-def main():
-    input_paths = []
-    output_path_override = None
+class GUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("3MF to GLB Converter")
+        self.root.geometry("700x500")
+        self.root.configure(padx=10, pady=10)
 
+        import tkinter as tk
+        from tkinter import ttk, filedialog, scrolledtext
+
+        # Top frame - buttons
+        btn_frame = ttk.Frame(root)
+        btn_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Button(btn_frame, text="Add 3MF Files", command=self.add_files).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Clear List", command=self.clear_files).pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.convert_btn = ttk.Button(btn_frame, text="Convert All", command=self.start_conversion)
+        self.convert_btn.pack(side=tk.RIGHT)
+
+        # Middle frame - file list
+        list_frame = ttk.LabelFrame(root, text="Files to Convert")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        ysb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.listbox.yview)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.configure(yscrollcommand=ysb.set)
+
+        # Bottom frame - log
+        log_frame = ttk.LabelFrame(root, text="Conversion Log")
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.input_paths = []
+        
+    def log(self, text):
+        import tkinter as tk
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.root.update()
+
+    def add_files(self):
+        from tkinter import filedialog
+        file_paths = filedialog.askopenfilenames(
+            title="Select 3MF Files",
+            filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
+        )
+        for p in file_paths:
+            if p not in self.input_paths:
+                self.input_paths.append(p)
+                import os
+                self.listbox.insert(tk.END, os.path.basename(p))
+
+    def clear_files(self):
+        import tkinter as tk
+        self.input_paths.clear()
+        self.listbox.delete(0, tk.END)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def start_conversion(self):
+        import threading
+        if not self.input_paths:
+            self.log("No files selected to convert.")
+            return
+        
+        self.convert_btn.configure(state=tk.DISABLED)
+        threading.Thread(target=self.run_conversion, daemon=True).start()
+
+    def run_conversion(self):
+        import tkinter as tk
+        # Redirect stdout to the log widget
+        old_stdout = sys.stdout
+        class StdoutRedirector:
+            def __init__(self, log_func):
+                self.log_func = log_func
+                self.buf = ""
+            def write(self, s):
+                self.buf += s
+                if "\n" in self.buf:
+                    lines = self.buf.split("\n")
+                    for line in lines[:-1]:
+                        self.log_func(line)
+                    self.buf = lines[-1]
+            def flush(self):
+                if self.buf:
+                    self.log_func(self.buf)
+                    self.buf = ""
+        
+        sys.stdout = StdoutRedirector(self.log)
+        
+        try:
+            success_count = 0
+            for i, path in enumerate(self.input_paths):
+                if i > 0:
+                    print("\n")
+                if process_file(path, None):
+                    success_count += 1
+                    
+            print("\n" + "=" * 50)
+            print(f"Finished processing {len(self.input_paths)} file(s).")
+            print(f"Successful: {success_count} | Failed: {len(self.input_paths) - success_count}")
+            print("=" * 50)
+        finally:
+            sys.stdout.flush()
+            sys.stdout = old_stdout
+            self.root.after(0, lambda: self.convert_btn.configure(state=tk.NORMAL))
+
+
+def main():
     if len(sys.argv) > 1:
-        # Check if first argument is a directory
+        # Command-line / drag-and-drop mode
+        input_paths = []
+        output_path_override = None
+
         if len(sys.argv) == 2 and os.path.isdir(sys.argv[1]):
             directory = sys.argv[1]
             for file in os.listdir(directory):
                 if file.lower().endswith(".3mf"):
                     input_paths.append(os.path.join(directory, file))
         else:
-            # Handle multiple dragged files or explicit file paths
             for arg in sys.argv[1:]:
-                # Check for an output override (only valid if 1 input file and second arg isn't a 3mf)
                 if not arg.lower().endswith(".3mf") and len(input_paths) == 1 and len(sys.argv) == 3:
                      output_path_override = arg
                      continue
-                     
                 if os.path.isfile(arg) and arg.lower().endswith(".3mf"):
                     input_paths.append(arg)
-    else:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            file_paths = filedialog.askopenfilenames(
-                title="Select 3MF Files",
-                filetypes=[("3MF Files", "*.3mf"), ("All Files", "*.*")],
-            )
-            root.destroy()
-            if not file_paths:
-                print("No files selected.")
-                return
-            input_paths = list(file_paths)
-        except ImportError:
-            print("Usage: converter.py <input1.3mf> [input2.3mf...] OR directory")
+
+        if not input_paths:
+            print("ERROR: No 3MF files provided or found.")
+            if getattr(sys, "frozen", False):
+                input("Press Enter to exit...")
             return
 
-    if not input_paths:
-        print("ERROR: No 3MF files provided or found.")
+        print(f"Found {len(input_paths)} file(s) to process.")
+        success_count = 0
+        for i, path in enumerate(input_paths):
+            if i > 0:
+                print("\n")
+            out_path = output_path_override if len(input_paths) == 1 else None
+            if process_file(path, out_path):
+                success_count += 1
+                
+        print("\n" + "=" * 50)
+        print(f"Finished processing {len(input_paths)} file(s).")
+        print(f"Successful: {success_count} | Failed: {len(input_paths) - success_count}")
+        print("=" * 50)
+
         if getattr(sys, "frozen", False):
-            input("Press Enter to exit...")
-        return
-
-    print(f"Found {len(input_paths)} file(s) to process.")
-    
-    success_count = 0
-    for i, path in enumerate(input_paths):
-        if i > 0:
-            print("\n")
-        out_path = output_path_override if len(input_paths) == 1 else None
-        if process_file(path, out_path):
-            success_count += 1
-
-    print("\n" + "=" * 50)
-    print(f"Finished processing {len(input_paths)} file(s).")
-    print(f"Successful: {success_count} | Failed: {len(input_paths) - success_count}")
-    print("=" * 50)
-
-    if getattr(sys, "frozen", False):
-        input("\nPress Enter to exit...")
-
+            input("\nPress Enter to exit...")
+            
+    else:
+        # GUI mode
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            gui = GUI(root)
+            root.mainloop()
+        except ImportError:
+            print("Tkinter not available. Usage: converter.py <input1.3mf> [input2.3mf...] OR directory")
 
 if __name__ == "__main__":
     main()
