@@ -896,7 +896,10 @@ def main():
         if not input_paths:
             print("ERROR: No 3MF files provided or found.")
             if getattr(sys, "frozen", False):
-                input("Press Enter to exit...")
+                try:
+                    input("Press Enter to exit...")
+                except Exception:
+                    pass
             return
 
         print(f"Found {len(input_paths)} file(s) to process.")
@@ -914,7 +917,10 @@ def main():
         print("=" * 50)
 
         if getattr(sys, "frozen", False):
-            input("\nPress Enter to exit...")
+            try:
+                input("\nPress Enter to exit...")
+            except Exception:
+                pass
             
     else:
         # GUI mode
