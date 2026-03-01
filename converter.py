@@ -743,6 +743,7 @@ class GUI:
         self.root.update()
 
     def add_files(self):
+        import tkinter as tk
         from tkinter import filedialog
         file_paths = filedialog.askopenfilenames(
             title="Select 3MF Files",
