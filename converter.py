@@ -530,8 +530,8 @@ def convert_3mf_to_glb(input_path, output_path=None):
                     face_colors=face_colors_np,
                     process=False
                 )
-                # Unmerge faces so each triangle has unique vertices and sharp colors
-                mesh.unmerge_faces()
+                # Unmerge vertices so each triangle has unique vertices and sharp colors
+                mesh.unmerge_vertices()
             else:
                 # Uniform uncolored mesh! Use a PBRMaterial instead of baked vertex colors
                 # This allows it to be easily recolored in web viewers via material.color
@@ -585,8 +585,8 @@ def convert_3mf_to_glb(input_path, output_path=None):
                     face_colors=face_colors_np,
                     process=False
                 )
-                # Unmerge faces so each triangle has unique vertices and sharp colors
-                mesh.unmerge_faces()
+                # Unmerge vertices so each triangle has unique vertices and sharp colors
+                mesh.unmerge_vertices()
             else:
                 # Uniform uncolored mesh! Use a PBRMaterial instead of baked vertex colors
                 # This allows it to be easily recolored in web viewers via material.color
@@ -682,7 +682,6 @@ def process_file(input_path, output_path=None):
         print(f"ERROR: File not found: {input_path}")
         return False
 
-    import os
     print("=" * 50)
     print(f"  Converting: {os.path.basename(input_path)}")
     print("=" * 50)
@@ -710,6 +709,10 @@ class GUI:
 
         import tkinter as tk
         from tkinter import ttk, filedialog, scrolledtext
+        import queue
+
+        # Thread-safe queue for log messages
+        self.log_queue = queue.Queue()
 
         # Top frame - buttons
         btn_frame = ttk.Frame(root)
@@ -741,22 +744,32 @@ class GUI:
 
         self.input_paths = []
         
-    def log(self, text):
-        # Schedule the UI update on the main thread safely
-        self.root.after(0, self._append_log, text)
+        # Start the UI polling loop for log messages
+        self.root.after(50, self.poll_log_queue)
         
-    def _append_log(self, text):
+    def poll_log_queue(self):
         import tkinter as tk
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, text + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        try:
+            while True:
+                text = self.log_queue.get_nowait()
+                self.log_text.configure(state=tk.NORMAL)
+                self.log_text.insert(tk.END, text)
+                self.log_text.see(tk.END)
+                self.log_text.configure(state=tk.DISABLED)
+                self.log_text.update_idletasks() # Force redraw immediately
+        except BaseException: # queue.Empty is not always easily catchable here depending on imports
+            pass
+        finally:
+            self.root.after(50, self.poll_log_queue)
+
+    def log(self, text):
+        self.log_queue.put(text)
 
     def _update_listbox(self, index, text):
         self.listbox.delete(index)
         self.listbox.insert(index, text)
-        # Keep the updated item visible
         self.listbox.see(index)
+        self.listbox.update_idletasks()
 
     def add_files(self):
         import tkinter as tk
@@ -782,11 +795,10 @@ class GUI:
     def start_conversion(self):
         import threading
         if not self.input_paths:
-            self.log("No files selected to convert.")
+            self.log("No files selected to convert.\n")
             return
         
-        self.convert_btn.configure(state=tk.DISABLED)
-        # Reset the view text in case we are running it again
+        self.convert_btn.configure(state="disabled")
         import os
         for i, path in enumerate(self.input_paths):
             self._update_listbox(i, os.path.basename(path))
@@ -796,25 +808,21 @@ class GUI:
     def run_conversion(self):
         import sys
         import os
-        # Redirect stdout to the log widget
+        
         old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        
         class StdoutRedirector:
             def __init__(self, log_func):
                 self.log_func = log_func
-                self.buf = ""
             def write(self, s):
-                self.buf += s
-                if "\n" in self.buf:
-                    lines = self.buf.split("\n")
-                    for line in lines[:-1]:
-                        self.log_func(line)
-                    self.buf = lines[-1]
+                if s:
+                    self.log_func(s)
             def flush(self):
-                if self.buf:
-                    self.log_func(self.buf)
-                    self.buf = ""
+                pass
         
         sys.stdout = StdoutRedirector(self.log)
+        sys.stderr = sys.stdout
         
         try:
             success_count = 0
@@ -835,10 +843,13 @@ class GUI:
             print(f"Finished processing {len(self.input_paths)} file(s).")
             print(f"Successful: {success_count} | Failed: {len(self.input_paths) - success_count}")
             print("=" * 50)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
         finally:
-            sys.stdout.flush()
             sys.stdout = old_stdout
-            self.root.after(0, lambda: self.convert_btn.configure(state=tk.NORMAL))
+            sys.stderr = old_stderr
+            self.root.after(0, lambda: self.convert_btn.configure(state="normal"))
 
 
 def main():
