@@ -26,6 +26,7 @@ import trimesh
 NS_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
 NS_MATERIAL = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
 NS_PRODUCTION = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+NS_SLIC3R = "http://schemas.slic3r.org/3mf/2017/06"
 
 
 def parse_hex_color(hex_str):
@@ -109,7 +110,8 @@ def parse_transform(transform_str):
 
 
 def get_filament_colors(zip_file):
-    """Extract filament colors from BambuStudio project settings."""
+    """Extract filament colors from BambuStudio or PrusaSlicer settings."""
+    # Try BambuStudio project_settings.config (JSON)
     for name in zip_file.namelist():
         if name.lower() == "metadata/project_settings.config":
             try:
@@ -120,6 +122,24 @@ def get_filament_colors(zip_file):
                     return [parse_hex_color(hc) for hc in hex_colors]
             except (json.JSONDecodeError, KeyError, ValueError):
                 pass
+
+    # Try PrusaSlicer Slic3r_PE.config (INI-style)
+    for name in zip_file.namelist():
+        if name.lower() in ("metadata/slic3r_pe.config", "metadata/prusa slicer.config"):
+            try:
+                data = zip_file.read(name).decode("utf-8")
+                import re as _re
+                # Look for extruder_colour first, then filament_colour
+                for key in ["extruder_colour", "filament_colour"]:
+                    match = _re.search(rf"; {key} = (.+)", data)
+                    if match:
+                        raw = match.group(1).strip()
+                        hex_colors = [c.strip() for c in raw.split(";") if c.strip()]
+                        if hex_colors and any(c != hex_colors[0] for c in hex_colors):
+                            return [parse_hex_color(hc) for hc in hex_colors]
+            except (KeyError, ValueError):
+                pass
+
     return None
 
 
@@ -197,8 +217,17 @@ def stream_parse_model(file_obj, basematerials, colorgroups, filament_colors):
 
                 color = None
 
-                # BambuStudio paint_color
+                # BambuStudio paint_color or PrusaSlicer mmu_segmentation
                 paint_color = elem.get("paint_color")
+                if paint_color is None:
+                    # Try PrusaSlicer slic3rpe:mmu_segmentation
+                    paint_color = elem.get(f"{{{NS_SLIC3R}}}mmu_segmentation")
+                if paint_color is None:
+                    # Try without namespace prefix (iterparse may strip it)
+                    for attr_name in elem.attrib:
+                        if 'mmu_segmentation' in attr_name:
+                            paint_color = elem.attrib[attr_name]
+                            break
                 if paint_color is not None and filament_colors:
                     filament_idx = decode_paint_color(paint_color)
                     if 0 <= filament_idx < len(filament_colors):
